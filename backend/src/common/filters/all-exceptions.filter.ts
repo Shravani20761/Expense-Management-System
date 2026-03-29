@@ -1,5 +1,6 @@
 import { ExceptionFilter, Catch, ArgumentsHost, HttpException, HttpStatus, Logger } from '@nestjs/common';
 import { Request, Response } from 'express';
+import * as fs from 'fs';
 
 @Catch()
 export class AllExceptionsFilter implements ExceptionFilter {
@@ -21,6 +22,11 @@ export class AllExceptionsFilter implements ExceptionFilter {
       this.logger.error(exception);
     }
 
+    try {
+      const logMsg = `[EXCEPT] Status: ${status}, Path: ${request.url}, Method: ${request.method}, Msg: ${JSON.stringify(message)}, User: ${JSON.stringify((request as any).user)}\n`;
+      fs.appendFileSync('backend_errors.log', logMsg);
+    } catch (e) {}
+    
     response.status(status).json({
       statusCode: status,
       timestamp: new Date().toISOString(),

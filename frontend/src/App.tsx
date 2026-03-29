@@ -1,4 +1,10 @@
-import { useEffect, useMemo, useRef, useState, createContext, useContext } from "react";
+import { useEffect, useMemo, useRef, useState, createContext, useContext, useCallback } from "react";
+import {
+  getToken, setToken, clearToken, decodeToken,
+  apiLogin, apiSignup, apiGetMe, apiGetUsers, apiCreateUser, apiUpdateUser,
+  apiGetMyExpenses, apiGetAllExpenses, apiCreateExpense, apiApproveExpense, apiRejectExpense,
+  type BackendUser, type BackendExpense, type BackendRole,
+} from "./api";
 import { motion, AnimatePresence } from "framer-motion";
 
 // -----------------------------
@@ -12,6 +18,55 @@ function cn(...args: (string | false | null | undefined)[]) {
 // Types
 // -----------------------------
 type Role = "admin" | "manager" | "employee" | null;
+
+// Map backend uppercase roles to frontend lowercase
+function mapRole(r: BackendRole | string): Exclude<Role, null> {
+  const m: Record<string, Exclude<Role, null>> = { ADMIN: "admin", MANAGER: "manager", EMPLOYEE: "employee" };
+  return (m[r?.toUpperCase()] ?? "employee") as Exclude<Role, null>;
+}
+
+// Map backend status to frontend status
+function mapStatus(s: string): ExpenseStatus {
+  const m: Record<string, ExpenseStatus> = {
+    DRAFT: "draft",
+    PENDING: "waiting_approval",
+    APPROVED: "approved",
+    REJECTED: "rejected",
+    PAID: "approved",
+  };
+  return m[s?.toUpperCase()] ?? "draft";
+}
+
+function mapBackendUser(u: BackendUser): User {
+  return {
+    id: u.id,
+    name: u.email.split("@")[0], // fallback name until profile loaded
+    email: u.email,
+    role: mapRole(u.role),
+    managerId: u.managerId ?? undefined,
+    createdAt: u.createdAt,
+  };
+}
+
+function mapBackendExpense(e: BackendExpense): Expense {
+  return {
+    id: e.id,
+    ownerId: e.userId,
+    employeeName: e.userId,
+    title: e.description ?? e.category,
+    description: e.description ?? "",
+    category: (e.category as Category) ?? "Other",
+    date: e.expenseDate ?? e.createdAt,
+    amount: parseFloat(e.amount),
+    currency: (e.currency as CurrencyCode) ?? "USD",
+    convertedAmount: parseFloat(e.amountCompanyCurrency ?? e.amount),
+    receiptUrl: e.receiptUrl ?? undefined,
+    status: mapStatus(e.status),
+    approvals: [],
+    history: [{ at: e.createdAt, by: e.userId, action: "Submitted" }],
+    createdAt: e.createdAt,
+  };
+}
 
 type User = {
   id: string;
@@ -182,26 +237,30 @@ function seedExpenses(users: User[]): Expense[] {
 // -----------------------------
 type StoreState = {
   authUserId: string | null;
+  authRole: Exclude<Role, null> | null;
   company: Company;
   users: User[];
   expenses: Expense[];
   rules: ApprovalRule[];
   toasts: Toast[];
+  loading: boolean;
 };
 
 const StoreContext = createContext<{
   state: StoreState;
   setAuthUserId: (id: string | null) => void;
+  logout: () => void;
   addToast: (t: Omit<Toast, "id">) => void;
   removeToast: (id: string) => void;
-  createUser: (u: Omit<User, "id" | "createdAt">) => void;
+  createUser: (u: Omit<User, "id" | "createdAt"> & { email: string }) => Promise<string | undefined>;
   updateUser: (id: string, patch: Partial<User>) => void;
-  createExpense: (e: Omit<Expense, "id" | "createdAt" | "history" | "convertedAmount">) => string;
+  createExpense: (e: Omit<Expense, "id" | "createdAt" | "history" | "convertedAmount">) => Promise<string>;
   updateExpense: (id: string, patch: Partial<Expense>) => void;
-  approveExpense: (id: string, approverId: string, comment?: string) => void;
-  rejectExpense: (id: string, approverId: string, comment?: string) => void;
+  approveExpense: (id: string, approverId: string, comment?: string) => Promise<void>;
+  rejectExpense: (id: string, approverId: string, comment?: string) => Promise<void>;
   updateRule: (id: string, patch: Partial<ApprovalRule>) => void;
   updateCompany: (patch: Partial<Company>) => void;
+  refreshExpenses: () => Promise<void>;
 } | null>(null);
 
 function useStore() {
@@ -210,22 +269,82 @@ function useStore() {
   return ctx;
 }
 
-  function StoreProvider({ children }: { children: React.ReactNode }) {
+function StoreProvider({ children }: { children: React.ReactNode }) {
   const [state, setState] = useState<StoreState>(() => {
-    const company = seedCompany;
-    const users = seedUsers;
+    // Restore session from token if available
+    const token = getToken();
+    const decoded = token ? decodeToken(token) : null;
     return {
-      authUserId: null,
-      company,
-      users,
-      expenses: seedExpenses(users),
-      rules: seedRules,
+      authUserId: decoded?.sub ?? null,
+      authRole: decoded ? mapRole(decoded.role) : null,
+      company: { name: "Loading…", baseCurrency: "USD", country: "" },
+      users: [],
+      expenses: [],
+      rules: [{ id: "r1", name: "Default Flow", sequence: [], minApprovalPct: 100, managerIsApprover: true, appliesTo: "all" }],
       toasts: [],
+      loading: false,
     };
   });
 
+  // Load data when authenticated
+  const loadData = useCallback(async (userId: string, role: Exclude<Role, null>) => {
+    setState((s) => ({ ...s, loading: true }));
+    try {
+      const me = await apiGetMe();
+      const companyName = me.profile?.name ?? me.email.split("@")[0];
+
+      let users: User[] = [];
+      let expenses: Expense[] = [];
+
+      if (role === "admin" || role === "manager") {
+        const [backendUsers, backendExpenses] = await Promise.all([
+          apiGetUsers(),
+          apiGetAllExpenses(),
+        ]);
+        users = backendUsers.map(mapBackendUser);
+        expenses = backendExpenses.map((e) => {
+          const mapped = mapBackendExpense(e);
+          // Resolve employee name from loaded users
+          const owner = users.find((u) => u.id === e.userId);
+          mapped.employeeName = owner?.name ?? e.userId;
+          return mapped;
+        });
+      } else {
+        const backendExpenses = await apiGetMyExpenses();
+        expenses = backendExpenses.map(mapBackendExpense);
+        // Add self to users
+        users = [mapBackendUser({ id: me.id, email: me.email, role: me.role, companyId: me.companyId, managerId: me.managerId, isActive: me.isActive, createdAt: me.createdAt })];
+      }
+
+      setState((s) => ({
+        ...s,
+        loading: false,
+        company: { name: companyName, baseCurrency: "USD", country: "" },
+        users,
+        expenses,
+      }));
+    } catch (err) {
+      setState((s) => ({ ...s, loading: false }));
+    }
+  }, []);
+
+  useEffect(() => {
+    if (state.authUserId && state.authRole) {
+      loadData(state.authUserId, state.authRole);
+    }
+  }, [state.authUserId, state.authRole]);
+
   function setAuthUserId(id: string | null) {
-    setState((s) => ({ ...s, authUserId: id }));
+    const token = getToken();
+    const decoded = token ? decodeToken(token) : null;
+    const role = decoded ? mapRole(decoded.role) : null;
+    setState((s) => ({ ...s, authUserId: id, authRole: role }));
+  }
+
+  function logout() {
+    clearToken();
+    setState((s) => ({ ...s, authUserId: null, authRole: null, users: [], expenses: [] }));
+    window.location.hash = "#/signin";
   }
 
   function addToast(t: Omit<Toast, "id">) {
@@ -238,62 +357,75 @@ function useStore() {
     setState((s) => ({ ...s, toasts: s.toasts.filter((t) => t.id !== id) }));
   }
 
-  function createUser(u: Omit<User, "id" | "createdAt">) {
-    setState((s) => {
-      const id = "u" + (s.users.length + 1 + Math.floor(Math.random() * 1000));
-      const nu: User = { id, createdAt: new Date().toISOString(), ...u };
-      return { ...s, users: [nu, ...s.users] };
+  async function createUser(u: Omit<User, "id" | "createdAt"> & { email: string }) {
+    const res = await apiCreateUser({
+      name: u.name,
+      email: u.email,
+      role: u.role.toUpperCase() as BackendRole,
+      managerId: u.managerId,
     });
+    // Reload users list
+    if (state.authRole !== "employee") {
+      const backendUsers = await apiGetUsers();
+      setState((s) => ({ ...s, users: backendUsers.map(mapBackendUser) }));
+    }
+    return res.rawPassword_temporary;
+  }
+
+  async function refreshExpenses() {
+    if (state.authRole === "admin" || state.authRole === "manager") {
+      const backendExpenses = await apiGetAllExpenses();
+      setState((s) => ({
+        ...s,
+        expenses: backendExpenses.map((e) => {
+          const mapped = mapBackendExpense(e);
+          const owner = s.users.find((u) => u.id === e.userId);
+          mapped.employeeName = owner?.name ?? e.userId;
+          return mapped;
+        }),
+      }));
+    } else {
+      const backendExpenses = await apiGetMyExpenses();
+      setState((s) => ({ ...s, expenses: backendExpenses.map(mapBackendExpense) }));
+    }
   }
 
   function updateUser(id: string, patch: Partial<User>) {
+    // Optimistic update UI only; full sync via API below
     setState((s) => ({ ...s, users: s.users.map((u) => (u.id === id ? { ...u, ...patch } : u)) }));
+    if (patch.role || patch.managerId !== undefined) {
+      apiUpdateUser(id, {
+        role: patch.role?.toUpperCase() as BackendRole | undefined,
+        managerId: patch.managerId,
+      }).catch(() => {});
+    }
   }
 
-  function createExpense(e: Omit<Expense, "id" | "createdAt" | "history" | "convertedAmount">) {
-    let newId = "";
-    setState((s) => {
-      const id = "e" + (s.expenses.length + 1 + Math.floor(Math.random() * 1000));
-      newId = id;
-      const convertedAmount = toBase(e.amount, e.currency);
-      const ne: Expense = {
-        id,
-        createdAt: new Date().toISOString(),
-        history: [{ at: new Date().toISOString(), by: e.employeeName, action: "Submitted" }],
-        convertedAmount,
-        ...e,
-      };
-      return { ...s, expenses: [ne, ...s.expenses] };
+  async function createExpense(e: Omit<Expense, "id" | "createdAt" | "history" | "convertedAmount">) {
+    const result = await apiCreateExpense({
+      amount: e.amount,
+      currency: e.currency,
+      category: e.category,
+      description: e.description,
+      receiptUrl: e.receiptUrl,
+      isDraft: e.status === "draft",
     });
-    return newId;
+    await refreshExpenses();
+    return result.id;
   }
 
   function updateExpense(id: string, patch: Partial<Expense>) {
     setState((s) => ({ ...s, expenses: s.expenses.map((e) => (e.id === id ? { ...e, ...patch } : e)) }));
   }
 
-  function approveExpense(id: string, approverId: string, comment?: string) {
-    setState((s) => {
-      const expenses = s.expenses.map((e) => {
-        if (e.id !== id) return e;
-        const approvals = e.approvals.map((a) => (a.approverId === approverId ? { ...a, decision: "approved" as const, comment, at: new Date().toISOString() } : a));
-        const history = [...e.history, { at: new Date().toISOString(), by: s.users.find((u) => u.id === approverId)?.name ?? "Approver", action: "Approved", note: comment }];
-        return { ...e, approvals, status: "approved" as ExpenseStatus, history };
-      });
-      return { ...s, expenses };
-    });
+  async function approveExpense(id: string, _approverId: string, comment?: string) {
+    await apiApproveExpense(id, comment);
+    await refreshExpenses();
   }
 
-  function rejectExpense(id: string, approverId: string, comment?: string) {
-    setState((s) => {
-      const expenses = s.expenses.map((e) => {
-        if (e.id !== id) return e;
-        const approvals = e.approvals.map((a) => (a.approverId === approverId ? { ...a, decision: "rejected" as const, comment, at: new Date().toISOString() } : a));
-        const history = [...e.history, { at: new Date().toISOString(), by: s.users.find((u) => u.id === approverId)?.name ?? "Approver", action: "Rejected", note: comment }];
-        return { ...e, approvals, status: "rejected" as ExpenseStatus, history };
-      });
-      return { ...s, expenses };
-    });
+  async function rejectExpense(id: string, _approverId: string, comment?: string) {
+    await apiRejectExpense(id, comment);
+    await refreshExpenses();
   }
 
   function updateRule(id: string, patch: Partial<ApprovalRule>) {
@@ -304,7 +436,7 @@ function useStore() {
     setState((s) => ({ ...s, company: { ...s.company, ...patch } }));
   }
 
-  const value = { state, setAuthUserId, addToast, removeToast, createUser, updateUser, createExpense, updateExpense, approveExpense, rejectExpense, updateRule, updateCompany };
+  const value = { state, setAuthUserId, logout, addToast, removeToast, createUser, updateUser, createExpense, updateExpense, approveExpense, rejectExpense, updateRule, updateCompany, refreshExpenses };
   return <StoreContext.Provider value={value}>{children}</StoreContext.Provider>;
 }
 
@@ -850,7 +982,7 @@ function RoleShell({
   activePath: string;
   title: string;
 }) {
-  const { state, setAuthUserId } = useStore();
+  const { state, logout } = useStore();
   const me = state.users.find((u) => u.id === state.authUserId) || null;
 
   const adminItems = [
@@ -887,10 +1019,7 @@ function RoleShell({
               </div>
             </div>
             <button
-              onClick={() => {
-                setAuthUserId(null);
-                window.location.hash = "#/signin";
-              }}
+              onClick={logout}
               className="rounded-xl bg-zinc-100 px-3 py-1.5 text-xs font-medium dark:bg-zinc-800"
             >
               Sign out
@@ -1751,18 +1880,33 @@ function AboutPage() {
 }
 
 function SignUpPage() {
-  const { createUser, setAuthUserId, addToast, state } = useStore();
-  const [name, setName] = useState("Ava Patel");
-  const [email, setEmail] = useState("admin@acme.test");
-  const [companyName, setCompanyName] = useState("Acme Corp");
-  function submit(e: React.FormEvent) {
+  const { setAuthUserId, addToast } = useStore();
+  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [companyName, setCompanyName] = useState("");
+  const [baseCurrency, setBaseCurrency] = useState("USD");
+  const [loading, setLoading] = useState(false);
+
+  async function submit(e: React.FormEvent) {
     e.preventDefault();
-    createUser({ name, email, role: "admin" });
-    // simulate auto login as the first admin found
-    const admin = state.users.find((u) => u.role === "admin") ?? { id: "u1" } as User;
-    setAuthUserId(admin.id);
-    addToast({ title: "Company created", description: `${companyName} is ready`, type: "success" });
-    window.location.hash = "#/admin/dashboard";
+    if (!email || !password || !companyName) {
+      addToast({ title: "Missing fields", type: "error" });
+      return;
+    }
+    setLoading(true);
+    try {
+      const res = await apiSignup({ email, password, companyName, baseCurrency });
+      setToken(res.access_token);
+      const decoded = decodeToken(res.access_token);
+      setAuthUserId(decoded?.sub ?? null);
+      addToast({ title: "Company created!", description: `${companyName} is ready`, type: "success" });
+      window.location.hash = "#/admin/dashboard";
+    } catch (err: any) {
+      addToast({ title: "Sign up failed", description: err.message, type: "error" });
+    } finally {
+      setLoading(false);
+    }
   }
   return (
     <PublicLayout title="Create your company" subtitle="Start as Company Admin and invite your team.">
@@ -1770,17 +1914,25 @@ function SignUpPage() {
         <form onSubmit={submit} className="space-y-3">
           <div>
             <div className="mb-1 text-xs font-medium uppercase tracking-wide text-zinc-500">Company name</div>
-            <input className="w-full rounded-2xl border border-zinc-300 px-3 py-2 dark:border-zinc-700 dark:bg-zinc-900" value={companyName} onChange={(e) => setCompanyName(e.target.value)} />
+            <input className="w-full rounded-2xl border border-zinc-300 px-3 py-2 dark:border-zinc-700 dark:bg-zinc-900" value={companyName} onChange={(e) => setCompanyName(e.target.value)} required />
           </div>
           <div>
-            <div className="mb-1 text-xs font-medium uppercase tracking-wide text-zinc-500">Your name</div>
-            <input className="w-full rounded-2xl border border-zinc-300 px-3 py-2 dark:border-zinc-700 dark:bg-zinc-900" value={name} onChange={(e) => setName(e.target.value)} />
+            <div className="mb-1 text-xs font-medium uppercase tracking-wide text-zinc-500">Base currency</div>
+            <select className="w-full rounded-2xl border border-zinc-300 px-3 py-2 dark:border-zinc-700 dark:bg-zinc-900" value={baseCurrency} onChange={(e) => setBaseCurrency(e.target.value)}>
+              {CURRENCIES.map((c) => <option key={c} value={c}>{c}</option>)}
+            </select>
           </div>
           <div>
-            <div className="mb-1 text-xs font-medium uppercase tracking-wide text-zinc-500">Work email</div>
-            <input type="email" className="w-full rounded-2xl border border-zinc-300 px-3 py-2 dark:border-zinc-700 dark:bg-zinc-900" value={email} onChange={(e) => setEmail(e.target.value)} />
+            <div className="mb-1 text-xs font-medium uppercase tracking-wide text-zinc-500">Admin email</div>
+            <input type="email" className="w-full rounded-2xl border border-zinc-300 px-3 py-2 dark:border-zinc-700 dark:bg-zinc-900" value={email} onChange={(e) => setEmail(e.target.value)} required />
           </div>
-          <button className="w-full rounded-2xl bg-sky-600 px-4 py-3 text-sm font-semibold text-white hover:bg-sky-500">Create company</button>
+          <div>
+            <div className="mb-1 text-xs font-medium uppercase tracking-wide text-zinc-500">Password</div>
+            <input type="password" className="w-full rounded-2xl border border-zinc-300 px-3 py-2 dark:border-zinc-700 dark:bg-zinc-900" value={password} onChange={(e) => setPassword(e.target.value)} required />
+          </div>
+          <button disabled={loading} className="w-full rounded-2xl bg-sky-600 px-4 py-3 text-sm font-semibold text-white hover:bg-sky-500 disabled:opacity-50">
+            {loading ? "Creating…" : "Create company"}
+          </button>
           <div className="text-center text-xs text-zinc-500">Already have an account? <a className="underline" href="#/signin">Sign in</a></div>
         </form>
       </AuthCard>
@@ -1789,33 +1941,45 @@ function SignUpPage() {
 }
 
 function SignInPage() {
-  const { state, setAuthUserId, addToast } = useStore();
-  const [email, setEmail] = useState("employee@acme.test");
-  function submit(e: React.FormEvent) {
+  const { setAuthUserId, addToast } = useStore();
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  async function submit(e: React.FormEvent) {
     e.preventDefault();
-    const user = state.users.find((u) => u.email.toLowerCase() === email.toLowerCase());
-    if (!user) {
-      addToast({ title: "No user found", description: "Try one of the demo emails", type: "error" });
-      return;
+    setLoading(true);
+    try {
+      const res = await apiLogin(email, password);
+      setToken(res.access_token);
+      const decoded = decodeToken(res.access_token);
+      if (!decoded) throw new Error("Invalid token");
+      setAuthUserId(decoded.sub);
+      addToast({ title: "Welcome back!", type: "success" });
+      const role = mapRole(decoded.role);
+      const dest = role === "admin" ? "/admin/dashboard" : role === "manager" ? "/manager/dashboard" : "/employee/dashboard";
+      window.location.hash = "#" + dest;
+    } catch (err: any) {
+      addToast({ title: "Sign in failed", description: err.message, type: "error" });
+    } finally {
+      setLoading(false);
     }
-    setAuthUserId(user.id);
-    addToast({ title: `Welcome ${user.name.split(" ")[0]}`, type: "success" });
-    const dest = user.role === "admin" ? "/admin/dashboard" : user.role === "manager" ? "/manager/dashboard" : "/employee/dashboard";
-    window.location.hash = "#" + dest;
   }
   return (
-    <PublicLayout title="Sign in" subtitle="Use demo accounts to explore each role.">
-      <AuthCard title="Sign in" subtitle="admin@acme.test • manager@acme.test • employee@acme.test">
+    <PublicLayout title="Sign in" subtitle="Sign in with your company account.">
+      <AuthCard title="Sign in" subtitle="Enter your email and password">
         <form onSubmit={submit} className="space-y-3">
           <div>
             <div className="mb-1 text-xs font-medium uppercase tracking-wide text-zinc-500">Email</div>
-            <input className="w-full rounded-2xl border border-zinc-300 px-3 py-2 dark:border-zinc-700 dark:bg-zinc-900" value={email} onChange={(e) => setEmail(e.target.value)} />
+            <input type="email" className="w-full rounded-2xl border border-zinc-300 px-3 py-2 dark:border-zinc-700 dark:bg-zinc-900" value={email} onChange={(e) => setEmail(e.target.value)} required />
           </div>
           <div>
             <div className="mb-1 text-xs font-medium uppercase tracking-wide text-zinc-500">Password</div>
-            <input type="password" className="w-full rounded-2xl border border-zinc-300 px-3 py-2 dark:border-zinc-700 dark:bg-zinc-900" placeholder="Anything" />
+            <input type="password" className="w-full rounded-2xl border border-zinc-300 px-3 py-2 dark:border-zinc-700 dark:bg-zinc-900" value={password} onChange={(e) => setPassword(e.target.value)} required />
           </div>
-          <button className="w-full rounded-2xl bg-sky-600 px-4 py-3 text-sm font-semibold text-white hover:bg-sky-500">Continue</button>
+          <button disabled={loading} className="w-full rounded-2xl bg-sky-600 px-4 py-3 text-sm font-semibold text-white hover:bg-sky-500 disabled:opacity-50">
+            {loading ? "Signing in…" : "Continue"}
+          </button>
           <div className="flex items-center justify-between text-xs">
             <a className="underline" href="#/forgot">Forgot password?</a>
             <a className="underline" href="#/signup">Create company</a>
@@ -1870,8 +2034,7 @@ function ResetPage() {
 // -----------------------------
 function EmployeeDashboard() {
   const { state } = useStore();
-  const me = state.users.find((u) => u.id === state.authUserId)!;
-  const myExpenses = state.expenses.filter((e) => e.ownerId === me.id);
+  const myExpenses = state.expenses;
   const waiting = myExpenses.filter((e) => e.status === "waiting_approval").length;
   const approved = myExpenses.filter((e) => e.status === "approved").length;
   const rejected = myExpenses.filter((e) => e.status === "rejected").length;
@@ -1909,17 +2072,17 @@ function EmployeeDashboard() {
 
 function SubmitExpensePage() {
   const { state, createExpense, addToast } = useStore();
-  const me = state.users.find((u) => u.id === state.authUserId)!;
   const [form, setForm] = useState<Partial<Expense>>({
     title: "",
     description: "",
     category: "Travel",
     date: new Date().toISOString().slice(0, 10),
     amount: 0,
-    currency: state.company.baseCurrency,
+    currency: state.company.baseCurrency ?? "USD",
   });
   const [receiptUrl, setReceiptUrl] = useState<string | undefined>(undefined);
   const [ocr, setOcr] = useState<Partial<Expense> | null>(null);
+  const [submitting, setSubmitting] = useState(false);
 
   function applyOCR(data: { fileUrl: string; fields: Partial<Expense> }) {
     setReceiptUrl(data.fileUrl);
@@ -1927,30 +2090,34 @@ function SubmitExpensePage() {
     setForm((f) => ({ ...f, ...data.fields }));
   }
 
-  function submit(e: React.FormEvent) {
+  async function submit(e: React.FormEvent) {
     e.preventDefault();
-    if (!form.title || !form.amount) {
-      addToast({ title: "Missing fields", description: "Please fill title and amount.", type: "error" });
+    if (!form.amount) {
+      addToast({ title: "Missing fields", description: "Please fill amount.", type: "error" });
       return;
     }
-    const ownerId = me.id;
-    const employeeName = me.name;
-    const dateISO = new Date(form.date ?? new Date()).toISOString();
-    const id = createExpense({
-      ownerId,
-      employeeName,
-      title: form.title!,
-      description: form.description,
-      category: (form.category as Category) ?? "Other",
-      date: dateISO,
-      amount: Number(form.amount),
-      currency: (form.currency as CurrencyCode) ?? state.company.baseCurrency,
-      receiptUrl,
-      status: "waiting_approval",
-      approvals: state.rules[0].sequence.map((aid) => ({ approverId: aid, decision: "pending" })),
-    });
-    addToast({ title: "Expense submitted", description: "Waiting for approval", type: "success" });
-    window.location.hash = `#/employee/expense/${id}`;
+    setSubmitting(true);
+    try {
+      const id = await createExpense({
+        ownerId: state.authUserId ?? "",
+        employeeName: "",
+        title: form.description ?? form.category ?? "Expense",
+        description: form.description,
+        category: (form.category as Category) ?? "Other",
+        date: new Date(form.date ?? new Date()).toISOString(),
+        amount: Number(form.amount),
+        currency: (form.currency as CurrencyCode) ?? "USD",
+        receiptUrl,
+        status: "waiting_approval",
+        approvals: [],
+      });
+      addToast({ title: "Expense submitted", description: "Waiting for approval", type: "success" });
+      window.location.hash = `#/employee/my-expenses`;
+    } catch (err: any) {
+      addToast({ title: "Failed to submit", description: err.message, type: "error" });
+    } finally {
+      setSubmitting(false);
+    }
   }
 
   return (
@@ -2002,7 +2169,7 @@ function SubmitExpensePage() {
             </div>
           </div>
           <div className="flex justify-end">
-            <button className="rounded-2xl bg-sky-600 px-5 py-3 text-sm font-semibold text-white hover:bg-sky-500">Submit for approval</button>
+            <button disabled={submitting} className="rounded-2xl bg-sky-600 px-5 py-3 text-sm font-semibold text-white hover:bg-sky-500 disabled:opacity-50">{submitting ? "Submitting…" : "Submit for approval"}</button>
           </div>
         </div>
         <div className="space-y-4">
@@ -2026,8 +2193,7 @@ function SubmitExpensePage() {
 
 function MyExpensesPage() {
   const { state } = useStore();
-  const me = state.users.find((u) => u.id === state.authUserId)!;
-  const myExpenses = state.expenses.filter((e) => e.ownerId === me.id);
+  const myExpenses = state.expenses;
   const [tab, setTab] = useState<ExpenseStatus | "all" | "to_submit">("all");
 
   const filtered = useMemo(() => {
@@ -2106,7 +2272,8 @@ function EmployeeExpenseDetail({ params }: { params: { id: string } }) {
 // Pages — Manager
 // -----------------------------
 function ManagerDashboard() {
-  const { state } = useStore();
+  const { state, refreshExpenses } = useStore();
+  useEffect(() => { refreshExpenses(); }, []);
   const queue = state.expenses.filter((e) => e.status === "waiting_approval");
   const approved = state.expenses.filter((e) => e.status === "approved").length;
   const rejected = state.expenses.filter((e) => e.status === "rejected").length;
@@ -2143,21 +2310,25 @@ function ManagerDashboard() {
 }
 
 function ApprovalsPage() {
-  const { state, approveExpense, rejectExpense, addToast } = useStore();
-  const me = state.users.find((u) => u.id === state.authUserId)!;
-  const queue = state.expenses.filter((e) => e.status === "waiting_approval" && e.approvals.some((a) => a.approverId === me.id && a.decision === "pending"));
+  const { state, approveExpense, rejectExpense, addToast, refreshExpenses } = useStore();
+  useEffect(() => { refreshExpenses(); }, []);
+  const queue = state.expenses.filter((e) => e.status === "waiting_approval");
   const [active, setActive] = useState<Expense | null>(null);
   const [comment, setComment] = useState("");
 
-  function doApprove(e: Expense) {
-    approveExpense(e.id, me.id, comment || undefined);
-    addToast({ title: "Approved", type: "success" });
+  async function doApprove(e: Expense) {
+    try {
+      await approveExpense(e.id, "", comment || undefined);
+      addToast({ title: "Approved", type: "success" });
+    } catch (err: any) { addToast({ title: "Failed", description: err.message, type: "error" }); }
     setActive(null);
     setComment("");
   }
-  function doReject(e: Expense) {
-    rejectExpense(e.id, me.id, comment || undefined);
-    addToast({ title: "Rejected", type: "error" });
+  async function doReject(e: Expense) {
+    try {
+      await rejectExpense(e.id, "", comment || undefined);
+      addToast({ title: "Rejected", type: "error" });
+    } catch (err: any) { addToast({ title: "Failed", description: err.message, type: "error" }); }
     setActive(null);
     setComment("");
   }
@@ -2205,11 +2376,10 @@ function ApprovalsPage() {
 
 function ManagerApprovalDetail({ params }: { params: { id: string } }) {
   const { state, approveExpense, rejectExpense, addToast } = useStore();
-  const me = state.users.find((u) => u.id === state.authUserId)!;
   const e = state.expenses.find((x) => x.id === params.id);
   const [comment, setComment] = useState("");
   if (!e) return <div className="p-8">Not found</div>;
-  const canAct = e.status === "waiting_approval" && e.approvals.some((a) => a.approverId === me.id && a.decision === "pending");
+  const canAct = e.status === "waiting_approval";
   return (
     <RoleShell role="manager" activePath="/manager/approvals" title="Approval Detail">
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-[1.2fr_0.8fr]">
@@ -2239,9 +2409,8 @@ function ManagerApprovalDetail({ params }: { params: { id: string } }) {
                 <div className="mt-3 flex gap-2">
                   <button
                     className="flex-1 rounded-2xl bg-emerald-600 px-4 py-3 text-sm font-semibold text-white hover:bg-emerald-500"
-                    onClick={() => {
-                      approveExpense(e.id, me.id, comment || undefined);
-                      addToast({ title: "Approved", type: "success" });
+                    onClick={async () => {
+                      try { await approveExpense(e.id, "", comment || undefined); addToast({ title: "Approved", type: "success" }); } catch {}
                       window.location.hash = "#/manager/approvals";
                     }}
                   >
@@ -2249,9 +2418,8 @@ function ManagerApprovalDetail({ params }: { params: { id: string } }) {
                   </button>
                   <button
                     className="flex-1 rounded-2xl bg-rose-600 px-4 py-3 text-sm font-semibold text-white hover:bg-rose-500"
-                    onClick={() => {
-                      rejectExpense(e.id, me.id, comment || undefined);
-                      addToast({ title: "Rejected", type: "error" });
+                    onClick={async () => {
+                      try { await rejectExpense(e.id, "", comment || undefined); addToast({ title: "Rejected", type: "error" }); } catch {}
                       window.location.hash = "#/manager/approvals";
                     }}
                   >
@@ -2290,7 +2458,8 @@ function ManagerApprovalDetail({ params }: { params: { id: string } }) {
 // Pages — Admin
 // -----------------------------
 function AdminDashboard() {
-  const { state } = useStore();
+  const { state, refreshExpenses } = useStore();
+  useEffect(() => { refreshExpenses(); }, []);
   const total = state.expenses.length;
   const waiting = state.expenses.filter((e) => e.status === "waiting_approval").length;
   const approved = state.expenses.filter((e) => e.status === "approved").length;
@@ -2329,16 +2498,22 @@ function AdminUsersPage() {
   const [email, setEmail] = useState("");
   const [role, setRole] = useState<Exclude<Role, null>>("employee");
   const [managerId, setManagerId] = useState<string | "">("");
+  const [creating, setCreating] = useState(false);
+  const [createdPassword, setCreatedPassword] = useState("");
 
-  function submit(e: React.FormEvent) {
+  async function submit(e: React.FormEvent) {
     e.preventDefault();
-    createUser({ name, email, role, managerId: managerId || null });
-    addToast({ title: "User created", type: "success" });
-    setOpen(false);
-    setName("");
-    setEmail("");
-    setRole("employee");
-    setManagerId("");
+    setCreating(true);
+    try {
+      const pwd = await createUser({ name, email, role, managerId: managerId || undefined });
+      if (pwd) setCreatedPassword(pwd);
+      addToast({ title: "User created", type: "success" });
+      setName(""); setEmail(""); setRole("employee"); setManagerId("");
+    } catch (err: any) {
+      addToast({ title: "Failed to create user", description: err.message, type: "error" });
+    } finally {
+      setCreating(false);
+    }
   }
 
   const managers = state.users.filter((u) => u.role === "manager" || u.role === "admin");
@@ -2401,41 +2576,54 @@ function AdminUsersPage() {
         </table>
       </div>
 
-      <Modal open={open} onClose={() => setOpen(false)} title="Create user">
-        <form onSubmit={submit} className="space-y-3">
-          <div>
-            <div className="mb-1 text-xs text-zinc-500">Name</div>
-            <input className="w-full rounded-2xl border border-zinc-300 px-3 py-2 dark:border-zinc-700 dark:bg-zinc-900" value={name} onChange={(e) => setName(e.target.value)} />
-          </div>
-          <div>
-            <div className="mb-1 text-xs text-zinc-500">Email</div>
-            <input className="w-full rounded-2xl border border-zinc-300 px-3 py-2 dark:border-zinc-700 dark:bg-zinc-900" value={email} onChange={(e) => setEmail(e.target.value)} />
-          </div>
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <div className="mb-1 text-xs text-zinc-500">Role</div>
-              <select className="w-full rounded-2xl border border-zinc-300 px-3 py-2 dark:border-zinc-700 dark:bg-zinc-900" value={role} onChange={(e) => setRole(e.target.value as any)}>
-                <option value="employee">employee</option>
-                <option value="manager">manager</option>
-                <option value="admin">admin</option>
-              </select>
+      <Modal open={open} onClose={() => { setOpen(false); setCreatedPassword(""); }} title="Create user">
+        {createdPassword ? (
+          <div className="space-y-4">
+            <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-4 text-emerald-900 dark:border-emerald-500/20 dark:bg-emerald-500/10 dark:text-emerald-200">
+              <div className="font-semibold mb-1">User Created Successfully!</div>
+              <div className="text-sm mb-2">Please copy their temporary password and send it to them securely:</div>
+              <div className="rounded-xl bg-white/50 dark:bg-black/20 p-3 text-lg font-mono tracking-wider font-bold text-center">{createdPassword}</div>
             </div>
-            <div>
-              <div className="mb-1 text-xs text-zinc-500">Manager</div>
-              <select className="w-full rounded-2xl border border-zinc-300 px-3 py-2 dark:border-zinc-700 dark:bg-zinc-900" value={managerId} onChange={(e) => setManagerId(e.target.value)}>
-                <option value="">—</option>
-                {managers.map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.name}
-                  </option>
-                ))}
-              </select>
+            <div className="flex justify-end">
+              <button onClick={() => { setOpen(false); setCreatedPassword(""); }} className="rounded-2xl bg-zinc-900 px-4 py-2 text-sm font-semibold text-white dark:bg-white dark:text-zinc-900">Close</button>
             </div>
           </div>
-          <div className="flex justify-end">
-            <button className="rounded-2xl bg-sky-600 px-4 py-2 text-sm font-semibold text-white hover:bg-sky-500">Create</button>
-          </div>
-        </form>
+        ) : (
+          <form onSubmit={submit} className="space-y-3">
+            <div>
+              <div className="mb-1 text-xs text-zinc-500">Name</div>
+              <input className="w-full rounded-2xl border border-zinc-300 px-3 py-2 dark:border-zinc-700 dark:bg-zinc-900" value={name} onChange={(e) => setName(e.target.value)} />
+            </div>
+            <div>
+              <div className="mb-1 text-xs text-zinc-500">Email</div>
+              <input className="w-full rounded-2xl border border-zinc-300 px-3 py-2 dark:border-zinc-700 dark:bg-zinc-900" value={email} onChange={(e) => setEmail(e.target.value)} />
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <div className="mb-1 text-xs text-zinc-500">Role</div>
+                <select className="w-full rounded-2xl border border-zinc-300 px-3 py-2 dark:border-zinc-700 dark:bg-zinc-900" value={role} onChange={(e) => setRole(e.target.value as any)}>
+                  <option value="employee">employee</option>
+                  <option value="manager">manager</option>
+                  <option value="admin">admin</option>
+                </select>
+              </div>
+              <div>
+                <div className="mb-1 text-xs text-zinc-500">Manager</div>
+                <select className="w-full rounded-2xl border border-zinc-300 px-3 py-2 dark:border-zinc-700 dark:bg-zinc-900" value={managerId} onChange={(e) => setManagerId(e.target.value)}>
+                  <option value="">—</option>
+                  {managers.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+            <div className="flex justify-end">
+              <button disabled={creating} className="rounded-2xl bg-sky-600 px-4 py-2 text-sm font-semibold text-white hover:bg-sky-500 disabled:opacity-50">{creating ? "Creating…" : "Create"}</button>
+            </div>
+          </form>
+        )}
       </Modal>
     </RoleShell>
   );
@@ -2484,8 +2672,9 @@ function AdminApproversPage() {
 }
 
 function AdminExpensesPage() {
-  const { state } = useStore();
+  const { state, refreshExpenses } = useStore();
   const [q, setQ] = useState("");
+  useEffect(() => { refreshExpenses(); }, []);
   const filtered = state.expenses.filter((e) => e.title.toLowerCase().includes(q.toLowerCase()) || e.employeeName.toLowerCase().includes(q.toLowerCase()));
   return (
     <RoleShell role="admin" activePath="/admin/expenses" title="All Expenses">
@@ -2581,9 +2770,7 @@ function Router() {
   const { state } = useStore();
   const hash = (typeof window !== "undefined" && window.location.hash.slice(1)) || "/";
   const needsAuth = hash.startsWith("/admin") || hash.startsWith("/manager") || hash.startsWith("/employee");
-  const me = state.users.find((u) => u.id === state.authUserId) || null;
-  if (needsAuth && !me) {
-    // redirect to signin
+  if (needsAuth && !state.authUserId) {
     setTimeout(() => (window.location.hash = "#/signin"), 0);
     return (
       <div className="grid min-h-screen place-items-center bg-zinc-50 dark:bg-zinc-950">
@@ -2592,17 +2779,12 @@ function Router() {
     );
   }
 
-  // Role guard
-  if (me) {
-    if (hash.startsWith("/admin") && me.role !== "admin") {
-      setTimeout(() => (window.location.hash = "#/signin"), 0);
-    }
-    if (hash.startsWith("/manager") && me.role !== "manager") {
-      setTimeout(() => (window.location.hash = "#/signin"), 0);
-    }
-    if (hash.startsWith("/employee") && me.role !== "employee") {
-      setTimeout(() => (window.location.hash = "#/signin"), 0);
-    }
+  // Role guard by authRole
+  const role = state.authRole;
+  if (role) {
+    if (hash.startsWith("/admin") && role !== "admin") setTimeout(() => (window.location.hash = "#/signin"), 0);
+    if (hash.startsWith("/manager") && role !== "manager") setTimeout(() => (window.location.hash = "#/signin"), 0);
+    if (hash.startsWith("/employee") && role !== "employee") setTimeout(() => (window.location.hash = "#/signin"), 0);
   }
 
   return (

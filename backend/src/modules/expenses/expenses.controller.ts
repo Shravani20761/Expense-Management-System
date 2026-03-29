@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Body, UseGuards } from '@nestjs/common';
+import { Controller, Get, Post, Body, Param, UseGuards } from '@nestjs/common';
 import { ExpensesService } from './expenses.service';
 import { CreateExpenseDto } from './dto/create-expense.dto';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
@@ -23,4 +23,31 @@ export class ExpensesController {
   async getMyExpenses(@CurrentUser() user: any) {
     return this.expensesService.getExpensesByUser(user.userId);
   }
+
+  @Roles(Role.MANAGER, Role.ADMIN)
+  @Get('all')
+  async getAllExpenses(@CurrentUser() user: any) {
+    return this.expensesService.getExpensesByCompany(user.companyId);
+  }
+
+  @Roles(Role.MANAGER, Role.ADMIN)
+  @Post(':id/approve')
+  async approveExpense(
+    @CurrentUser() user: any,
+    @Param('id') id: string,
+    @Body() body: { comment?: string },
+  ) {
+    return this.expensesService.approveExpense(id, user.companyId, user.userId, body.comment);
+  }
+
+  @Roles(Role.MANAGER, Role.ADMIN)
+  @Post(':id/reject')
+  async rejectExpense(
+    @CurrentUser() user: any,
+    @Param('id') id: string,
+    @Body() body: { comment?: string },
+  ) {
+    return this.expensesService.rejectExpense(id, user.companyId, user.userId, body.comment);
+  }
 }
+
