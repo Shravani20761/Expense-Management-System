@@ -1,0 +1,100 @@
+@baseUrl = http://localhost:3000
+
+# ======================================================================
+# 1. AUTHENTICATION (Run these first to capture tokens)
+# ======================================================================
+
+### 1a. Login as Admin
+### Click "Send Request" BELOW this line, NOT above it!
+# @name loginAdmin
+POST {{baseUrl}}/auth/login
+Content-Type: application/json
+
+{
+    "email": "admin@acme.com",
+    "password": "admin123" 
+}
+
+### 1b. Login as Manager
+# @name loginManager
+POST {{baseUrl}}/auth/login
+Content-Type: application/json
+
+{
+    "email": "manager@acme.com",
+    "password": "admin123"
+}
+
+### 1c. Login as Employee
+# @name loginEmployee
+POST {{baseUrl}}/auth/login
+Content-Type: application/json
+
+{
+    "email": "employee@acme.com",
+    "password": "admin123"
+}
+
+# ======================================================================
+# 2. PROFILES & USERS
+# ======================================================================
+
+### View your own profile details (Employee)
+GET {{baseUrl}}/users/me
+Authorization: Bearer {{loginEmployee.response.body.access_token}}
+
+# ======================================================================
+# 3. EXPENSES (The core Odoo workflow)
+# ======================================================================
+
+### 3a. Submit a new Expense Record (As Employee)
+# @name createExpense
+POST {{baseUrl}}/expenses
+Authorization: Bearer {{loginEmployee.response.body.access_token}}
+Content-Type: application/json
+
+{
+    "amount": 150.00,
+    "currency": "USD",
+    "category": "Travel",
+    "description": "Client Meeting Taxi",
+    "expenseDate": "2026-03-29T00:00:00.000Z"
+}
+
+
+### 3b. View Pending Approvals (As Manager)
+GET {{baseUrl}}/workflow/approvals
+Authorization: Bearer {{loginManager.response.body.access_token}}
+
+
+### 3c. Approve the Expense (As Manager)
+POST {{baseUrl}}/workflow/action
+Authorization: Bearer {{loginManager.response.body.access_token}}
+Content-Type: application/json
+
+{
+    "expenseId": "{{createExpense.response.body.id}}",
+    "action": "APPROVE",
+    "comments": "Looks good, approved for payout."
+}
+
+# ======================================================================
+# 4. REIMBURSEMENTS
+# ======================================================================
+
+### 4a. Mark Expense as Paid (As Admin/Finance)
+POST {{baseUrl}}/reimbursements
+Authorization: Bearer {{loginAdmin.response.body.access_token}}
+Content-Type: application/json
+
+{
+    "expenseId": "{{createExpense.response.body.id}}",
+    "amountPaid": 150.00,
+    "currency": "USD",
+    "paymentMethod": "BANK_TRANSFER",
+    "referenceNumber": "TXN_987654321"
+}
+
+### 4b. Employee Views their Payout Details
+GET {{baseUrl}}/reimbursements/expense/{{createExpense.response.body.id}}
+Authorization: Bearer {{loginEmployee.response.body.access_token}}
