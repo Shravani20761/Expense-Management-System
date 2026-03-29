@@ -24,27 +24,45 @@ export class AuthService {
 
     const passwordHash = await bcrypt.hash(signupDto.password, 10);
 
-    const result = await this.db.transaction(async (tx) => {
-      const [newCompany] = await tx
-        .insert(schema.companies)
-        .values({
-          name: signupDto.companyName,
-          baseCurrency: signupDto.baseCurrency,
-        })
-        .returning();
+    const [newCompany] = await this.db
+      .insert(schema.companies)
+      .values({
+        name: signupDto.companyName,
+        baseCurrency: signupDto.baseCurrency,
+      })
+      .returning();
 
-      const [newUser] = await tx
-        .insert(schema.users)
-        .values({
-          companyId: newCompany.id,
-          email: signupDto.email,
-          passwordHash,
-          role: 'ADMIN',
-        })
-        .returning();
+    const [newUser] = await this.db
+      .insert(schema.users)
+      .values({
+        companyId: newCompany.id,
+        email: signupDto.email,
+        passwordHash,
+        role: 'ADMIN',
+      })
+      .returning();
 
-      return { company: newCompany, user: newUser };
+    // Auto-create profile for the signed-up ADMIN
+    await this.usersService.createProfileForRole(newUser.id, newCompany.id, 'ADMIN', signupDto.companyName + ' Admin');
+
+    // Auto-create default approval workflow
+    const [step1] = await this.db
+      .insert(schema.approvalSteps)
+      .values({
+        companyId: newCompany.id,
+        name: 'Direct Manager Approval',
+        stepOrder: 1,
+        isSequential: true,
+      })
+      .returning();
+
+    await this.db.insert(schema.approvalRules).values({
+      stepId: step1.id,
+      ruleType: 'MANAGER_REQUIRED',
+      ruleConfig: { required: true },
     });
+
+    const result = { company: newCompany, user: newUser };
 
     const payload = {
       sub: result.user.id,

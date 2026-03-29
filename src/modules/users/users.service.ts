@@ -33,6 +33,7 @@ export class UsersService {
         role: true,
         managerId: true,
         isActive: true,
+        temporaryPassword: true,
         createdAt: true,
       },
     });
@@ -56,6 +57,7 @@ export class UsersService {
         passwordHash,
         managerId: createUserDto.managerId || null,
         mustChangePassword: true,
+        temporaryPassword: rawPassword,
       })
       .returning();
 

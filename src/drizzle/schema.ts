@@ -25,6 +25,7 @@ export const users = pgTable('users', {
   managerId: uuid('manager_id'), // Self-referencing UUID for hierarchy
   isActive: boolean('is_active').default(true).notNull(),
   mustChangePassword: boolean('must_change_password').default(false).notNull(),
+  temporaryPassword: varchar('temporary_password', { length: 255 }),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
