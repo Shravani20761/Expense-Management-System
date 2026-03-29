@@ -1,0 +1,14 @@
+[
+  {
+    "email": "admin@acme.com",
+    "role": "ADMIN"
+  },
+  {
+    "email": "manager@acme.com",
+    "role": "MANAGER"
+  },
+  {
+    "email": "employee@acme.com",
+    "role": "EMPLOYEE"
+  }
+]

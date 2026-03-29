@@ -73,4 +73,75 @@ export class ExpensesService {
       orderBy: (expenses: any, { desc }: any) => [desc(expenses.createdAt)]
     });
   }
+
+  async getExpensesByCompany(companyId: string) {
+    return this.db.query.expenses.findMany({
+      where: eq(schema.expenses.companyId, companyId),
+      orderBy: (expenses: any, { desc }: any) => [desc(expenses.createdAt)],
+    });
+  }
+
+  async approveExpense(expenseId: string, companyId: string, approverId: string, comment?: string) {
+    const expense = await this.db.query.expenses.findFirst({
+      where: and(eq(schema.expenses.id, expenseId), eq(schema.expenses.companyId, companyId)),
+    });
+
+    if (!expense) {
+      throw new NotFoundException('Expense not found.');
+    }
+
+    const firstStep = await this.db.query.approvalSteps.findFirst({
+      where: eq(schema.approvalSteps.companyId, companyId),
+    });
+
+    if (firstStep) {
+      await this.db.insert(schema.approvalActions).values({
+        expenseId,
+        stepId: firstStep.id,
+        approverId,
+        action: 'APPROVE',
+        comments: comment,
+      });
+    }
+
+    const [updated] = await this.db
+      .update(schema.expenses)
+      .set({ status: 'APPROVED' })
+      .where(eq(schema.expenses.id, expenseId))
+      .returning();
+
+    return updated;
+  }
+
+  async rejectExpense(expenseId: string, companyId: string, approverId: string, comment?: string) {
+    const expense = await this.db.query.expenses.findFirst({
+      where: and(eq(schema.expenses.id, expenseId), eq(schema.expenses.companyId, companyId)),
+    });
+
+    if (!expense) {
+      throw new NotFoundException('Expense not found.');
+    }
+
+    const firstStep = await this.db.query.approvalSteps.findFirst({
+      where: eq(schema.approvalSteps.companyId, companyId),
+    });
+
+    if (firstStep) {
+      await this.db.insert(schema.approvalActions).values({
+        expenseId,
+        stepId: firstStep.id,
+        approverId,
+        action: 'REJECT',
+        comments: comment,
+      });
+    }
+
+    const [updated] = await this.db
+      .update(schema.expenses)
+      .set({ status: 'REJECTED' })
+      .where(eq(schema.expenses.id, expenseId))
+      .returning();
+
+    return updated;
+  }
 }
